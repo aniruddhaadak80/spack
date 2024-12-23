@@ -28,6 +28,7 @@ from typing import (
     List,
     NamedTuple,
     Optional,
+    Sequence,
     Set,
     Tuple,
     Type,
@@ -1159,7 +1160,7 @@ class PyclingoDriver:
         if sys.platform == "win32":
             tty.debug("Ensuring basic dependencies {win-sdk, wgl} available")
             spack.bootstrap.core.ensure_winsdk_external_or_raise()
-        control_files = ["concretize.lp", "heuristic.lp", "display.lp"]
+        control_files = ["concretize.lp", "heuristic.lp", "display.lp", "spec_prefs.lp"]
         if not setup.concretize_everything:
             control_files.append("when_possible.lp")
         if using_libc_compatibility():
@@ -1538,6 +1539,9 @@ class SpackSolverSetup:
 
         # If true, we have to load the code for synthesizing splices
         self.enable_splicing: bool = spack.config.CONFIG.get("concretizer:splice:automatic")
+
+        # list of specs whose attributes we should try to match during solve
+        self.spec_prefs: Optional[Sequence[spack.spec.Spec]] = None
 
     def pkg_version_rules(self, pkg):
         """Output declared versions of a package.
@@ -2977,6 +2981,17 @@ class SpackSolverSetup:
                 if spec.concrete:
                     self.register_concrete_spec(spec, possible)
 
+    def generate_spec_prefs(self):
+        for spec in self.spec_prefs:
+            # skip unreachable preferences
+            if spec.name not in self.pkgs:
+                continue
+
+            for clause in self.spec_clauses(spec, body=True):
+                self.gen.fact(fn.spec_pref(clause))
+
+            self.gen.newline()
+
     def setup(
         self,
         specs: List[spack.spec.Spec],
@@ -3036,6 +3051,8 @@ class SpackSolverSetup:
         dev_specs: Tuple[spack.spec.Spec, ...] = ()
         env = ev.active_environment()
         if env:
+            # Calculate develop specs they will be used in addition to command line
+            # specs in determining known versions/targets/os
             dev_specs = tuple(
                 spack.spec.Spec(info["spec"]).constrained(
                     'dev_path="%s"'
@@ -3043,6 +3060,14 @@ class SpackSolverSetup:
                 )
                 for name, info in env.dev_specs.items()
             )
+
+            # Add spec preferences from lockfile if there is one. This causes the solver to
+            # try to stick to what the user *already* has in their environment, so as not
+            # to give surprising results on re-concretizations.
+            self.spec_prefs = env.concrete_roots()
+            if self.spec_prefs:
+                self.gen.h1("Spec preferences (based on old lockfile)")
+                self.generate_spec_prefs()
 
         specs = tuple(specs)  # ensure compatible types to add
 
@@ -4576,7 +4601,9 @@ class Solver:
         specs = [s.lookup_hash() for s in specs]
         reusable_specs = self._check_input_and_extract_concrete_specs(specs)
         reusable_specs.extend(self.selector.reusable_specs(specs))
+
         setup = SpackSolverSetup(tests=tests)
+
         output = OutputConfiguration(timers=timers, stats=stats, out=out, setup_only=setup_only)
 
         CONC_CACHE.flush_manifest()

@@ -1632,6 +1632,12 @@ opt_criterion(310, "requirement weight").
     : requirement_weight(PackageNode, Group, Weight)
 }.
 
+% Try hardest to prefer what was in the lockfile
+opt_criterion(120, "attributes not in lockfile").
+#minimize { 0@120: #true }.
+#minimize { 1@120,Attribute : no_spec_pref(Attribute) }.
+#defined spec_pref/1.
+
 % Try hard to reuse installed packages (i.e., minimize the number built)
 opt_criterion(110, "number of packages to build (vs. reuse)").
 #minimize { 0@110: #true }.
