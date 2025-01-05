@@ -51,4 +51,4 @@
 #show variant_single_value/2.
 
 % debug
-#show no_spec_pref/1.
+#show no_spec_pref/2.
