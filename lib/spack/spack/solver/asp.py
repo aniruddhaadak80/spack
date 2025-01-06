@@ -1116,6 +1116,24 @@ class ErrorHandler:
         raise UnsatisfiableSpecError(msg)
 
 
+class SpecPrefHandler:
+    """Handles converting `no_spec_pref` predicates in a model into intelligible errors."""
+
+    def __init__(self, model):
+        self.model = model
+
+    def raise_if_prefs_violated(self):
+        """Raise an error if any spec preferences were violated in the solve."""
+        # extract attr(...) argument from no_spec_pref(Name, Attribute)
+        no_spec_prefs = [sym.arguments[1] for sym in self.model if sym.name == "no_spec_pref"]
+
+        # prepare to build specs
+        attrs = extract_args(no_spec_prefs)
+
+        # TODO: to get the right prefs in the solution we need to get rid of lockfile
+        # specs as inputs and instead use them as preferences.
+
+
 class PyclingoDriver:
     def __init__(self, cores=True):
         """Driver for the Python clingo interface.
@@ -1260,6 +1278,10 @@ class PyclingoDriver:
                 # first check for errors
                 error_handler = ErrorHandler(best_model, specs)
                 error_handler.raise_if_errors()
+
+                # if this isn't a force concretize, a violated spec_pref is an error.
+                if spack.config.get("concretizer:force", False):
+                    self.raise_if_violated_spec_prefs(best_model)
 
                 # build specs from spec attributes in the model
                 spec_attrs = [
