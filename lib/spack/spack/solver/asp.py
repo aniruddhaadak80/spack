@@ -1119,6 +1119,9 @@ class PyclingoDriver:
         if output.out is not None:
             output.out.write("\n".join(problem))
 
+        with open(f"dump-{specs[0].name}.lp", "w", encoding="utf-8") as f:
+            f.write("\n".join(problem))
+
         if output.setup_only:
             return Result(specs), None, None
 
