@@ -1254,6 +1254,112 @@ class BuildGraph:
                 pending_builds.append(parent)
 
 
+def schedule_builds(
+    pending_builds: List[str],
+    build_graph: "BuildGraph",
+    db: spack.database.Database,
+    prefix_locker: spack.database.SpecLocker,
+    overwrite: Set[str],
+    explicit: Set[str],
+    capacity: int,
+    has_running_builds: bool,
+    jobserver: "JobServer",
+) -> Tuple[bool, List[Tuple[str, spack.util.lock.Lock]], List[Tuple[str, spack.spec.Spec]]]:
+    """Try to schedule as many pending builds as possible.
+
+    For each pending spec, attempts to acquire a non-blocking per-spec write lock. Under both the
+    DB read lock and the prefix write lock, checks whether another process has already installed
+    the spec. If so, captures it as newly_installed (caller enqueues parents) and releases the
+    lock. Otherwise, acquires a jobserver token if needed and adds the (dag_hash, lock) pair to
+    to_start (caller launches the build).
+
+    Args:
+        pending_builds: List of dag hashes pending installation; modified in-place.
+        build_graph: The build dependency graph; used for node lookup and parent enqueueing.
+        db: Package database; used for read lock and installed-status queries.
+        prefix_locker: Per-spec write locker.
+        overwrite: Set of dag hashes to overwrite even if already installed.
+        explicit: Set of dag hashes explicitly requested by the user.
+        capacity: Maximum number of new builds to add to to_start in this call.
+        has_running_builds: True if a jobserver token is required for the first new build.
+        jobserver: Jobserver for acquiring tokens.
+
+    Returns:
+        A (blocked_on_locks, to_start, newly_installed) tuple where:
+        - blocked_on_locks: True if all remaining pending specs are locked by other processes.
+        - to_start: (dag_hash, lock) pairs; prefix write locks are already held, caller must
+          start the build and eventually release the lock.
+        - newly_installed: (dag_hash, spec) pairs found already installed by another process;
+          caller must update build_status and call build_graph.enqueue_parents.
+    """
+    to_start: List[Tuple[str, spack.util.lock.Lock]] = []
+    newly_installed: List[Tuple[str, spack.spec.Spec]] = []
+
+    # Acquire the DB read lock non-blocking; hold it throughout the loop so the in-memory
+    # snapshot stays consistent while we acquire per-spec prefix locks.
+    try:
+        db.lock.acquire_read(timeout=1e-9)
+    except spack.util.lock.LockTimeoutError:
+        return False, to_start, newly_installed
+
+    try:
+        db._read()  # refresh in-memory snapshot under the read lock
+        need_token = has_running_builds
+        any_lock_acquired = False
+        local_cap = capacity
+        idx = 0
+
+        while idx < len(pending_builds):
+            dag_hash = pending_builds[idx]
+            if local_cap <= 0:
+                return False, to_start, newly_installed
+
+            spec = build_graph.nodes[dag_hash]
+            lock = prefix_locker.lock(spec)
+            try:
+                lock.acquire_write(timeout=1e-9)
+            except spack.util.lock.LockTimeoutError:
+                idx += 1
+                continue  # another process is building this spec; try the next one
+
+            # Successfully acquired the write lock for this spec.
+            any_lock_acquired = True
+
+            # Check installed status under the DB read lock and prefix write lock.
+            upstream, record = db.query_by_spec_hash(dag_hash)
+
+            # Don't schedule builds for specs from upstream databases.
+            assert not (
+                upstream and record and not record.installed
+            ), f"Cannot install {spec}: it is uninstalled in an upstream database."
+
+            # If the spec is already installed by another process, capture it and enqueue parents.
+            if dag_hash not in overwrite and record and record.installed:
+                lock.release_write()
+                del pending_builds[idx]
+                newly_installed.append((dag_hash, spec))
+                build_graph.enqueue_parents(dag_hash, pending_builds)
+                continue
+
+            # Acquire a jobserver token if needed. The first (implicit) job needs no token.
+            if need_token and not jobserver.acquire(1):
+                lock.release_write()
+                break  # no tokens available right now; stop scheduling
+
+            del pending_builds[idx]
+            to_start.append((dag_hash, lock))
+            local_cap -= 1
+            need_token = True
+
+    finally:
+        db.lock.release_read()
+
+    # If we still have pending builds and never acquired any lock, all are blocked by other
+    # processes and there is no benefit in monitoring the jobserver for tokens.
+    blocked_on_locks = bool(pending_builds) and not any_lock_acquired
+    return blocked_on_locks, to_start, newly_installed
+
+
 class PackageInstaller:
 
     def __init__(
@@ -1552,76 +1658,30 @@ class PackageInstaller:
     def _schedule_builds(self, selector: selectors.BaseSelector, jobserver: JobServer) -> bool:
         """Try to schedule as many pending builds as possible.
 
-        For each pending spec, attempts to acquire a non-blocking per-spec write lock. Under both
-        the DB read lock and the prefix write lock, checks whether another process has already
-        installed the spec. If so, skips it and enqueues its parents. Otherwise, acquires a
-        jobserver token (if needed) and starts the build.
+        Delegates to the module-level schedule_builds() function and then performs the
+        side-effects that require the selector and running-build state: updating build_status for
+        specs that were found already installed, and launching new builds via _start().
 
         Returns True if all remaining pending specs are locked by other processes (i.e., there is
         no point in watching for jobserver tokens right now). Returns False if there are
         schedulable specs or no pending builds remain."""
-
-        # Acquire the DB read lock non-blocking; hold it throughout the loop so the in-memory
-        # snapshot stays consistent while we acquire per-spec prefix locks.
-        try:
-            self.db.lock.acquire_read(timeout=1e-9)
-        except spack.util.lock.LockTimeoutError:
-            return False
-
-        try:
-            self.db._read()  # refresh in-memory snapshot under the read lock
-            need_token = bool(self.running_builds)
-            any_lock_acquired = False
-            idx = 0
-
-            while idx < len(self.pending_builds):
-                dag_hash = self.pending_builds[idx]
-                if self.capacity <= 0:
-                    return False
-
-                spec = self.build_graph.nodes[dag_hash]
-                lock = spack.store.STORE.prefix_locker.lock(spec)
-                try:
-                    lock.acquire_write(timeout=1e-9)
-                except spack.util.lock.LockTimeoutError:
-                    idx += 1
-                    continue  # another process is building this spec; try the next one
-
-                # Successfully acquired the write lock for this spec.
-                any_lock_acquired = True
-
-                # Check installed status under the DB read lock and prefix write lock.
-                upstream, record = self.db.query_by_spec_hash(dag_hash)
-
-                # Don't schedule builds for specs from upstream databases.
-                assert not (
-                    upstream and record and not record.installed
-                ), f"Cannot install {spec}: it is uninstalled in an upstream database."
-
-                # If the spec is already installed by another process, skip it and enqueue parents.
-                if dag_hash not in self.overwrite and record and record.installed:
-                    lock.release_write()
-                    del self.pending_builds[idx]
-                    self.build_status.add_build(spec, explicit=dag_hash in self.explicit)
-                    self.build_status.update_state(dag_hash, "finished")
-                    self.build_graph.enqueue_parents(dag_hash, self.pending_builds)
-                    continue
-
-                # Acquire a jobserver token if needed. The first (implicit) job needs no token.
-                if need_token and not jobserver.acquire(1):
-                    lock.release_write()
-                    break  # no tokens available right now; stop scheduling
-
-                del self.pending_builds[idx]
-                self._start(selector, jobserver, dag_hash, lock)
-                need_token = True
-
-        finally:
-            self.db.lock.release_read()
-
-        # If we still have pending builds and never acquired any lock, all are blocked by other
-        # processes and there is no benefit in monitoring the jobserver for tokens.
-        return bool(self.pending_builds) and not any_lock_acquired
+        blocked, to_start, newly_installed = schedule_builds(
+            self.pending_builds,
+            self.build_graph,
+            self.db,
+            spack.store.STORE.prefix_locker,
+            self.overwrite,
+            self.explicit,
+            self.capacity,
+            bool(self.running_builds),
+            jobserver,
+        )
+        for dag_hash, spec in newly_installed:
+            self.build_status.add_build(spec, explicit=dag_hash in self.explicit)
+            self.build_status.update_state(dag_hash, "finished")
+        for dag_hash, lock in to_start:
+            self._start(selector, jobserver, dag_hash, lock)  # decrements self.capacity
+        return blocked
 
     def _start(
         self,
